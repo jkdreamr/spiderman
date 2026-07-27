@@ -1,0 +1,1707 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="data:,">
+<title>thwip</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #0a0a0f; overflow: hidden;
+  }
+  #cam {
+    position: fixed; left: 0; top: 0; width: 2px; height: 2px;
+    opacity: 0.001; pointer-events: none;
+  }
+  canvas { position: fixed; inset: 0; display: block; }
+  #videoCanvas { z-index: 1; }
+  #splatCanvas { z-index: 2; }
+  #webCanvas   { z-index: 3; }
+  #hud {
+    position: fixed; left: 8px; top: 6px; z-index: 5;
+    font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #dfe6f5; opacity: 0.4; white-space: pre; pointer-events: none;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.6);
+  }
+  #depthChip {
+    position: fixed; right: 8px; top: 6px; z-index: 5; display: none;
+    font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #dfe6f5; opacity: 0.45; padding: 4px 7px; border-radius: 3px;
+    background: rgba(255,255,255,0.06); pointer-events: none; letter-spacing: 0.03em;
+  }
+  #msg {
+    position: fixed; inset: 0; z-index: 9; display: none;
+    align-items: center; justify-content: center; text-align: center; padding: 0 24px;
+    font: 15px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #cfd6e6; background: #0a0a0f;
+  }
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay></video>
+<canvas id="videoCanvas"></canvas>
+<canvas id="splatCanvas"></canvas>
+<canvas id="webCanvas"></canvas>
+<div id="hud"></div>
+<div id="depthChip">DEPTH: off</div>
+<div id="msg"></div>
+
+<script type="module">
+/* =========================================================================
+   thwip — webcam Spider-Man web-shooter, simulated in metric 3D.
+
+   The scene is a right-handed camera frame: +X right on screen, +Y down,
+   +Z away from the viewer into the room. Everything below — the hand, the
+   projectile, the rope, the anchors, the splats — lives in metres in that
+   frame and is projected through a pinhole camera for drawing. That is what
+   makes a web fired "forwards" recede toward the vanishing point and fall,
+   and what lets anchors stay welded to the wall when the camera moves.
+
+   Modules: Camera, Cam3D, SmallFrame, EdgeMap, EgoMotion, Scene, DepthMode,
+            Sfx, Tracker, GestureFSM, WebPhysics, Splats, Spray, Renderer.
+   ========================================================================= */
+
+/* ------------------------------- constants ------------------------------ */
+const H          = 1 / 960;      // physics substep (s) — small steps beat iterations
+const MAX_SUB    = 26;           // substeps per frame before we drop time
+const ITER       = 2;            // Gauss-Seidel passes per substep
+const GRAV       = 9.81;         // m/s^2, +Y is down
+const ROPE_C     = 0.15;         // continuous damping rate (1/s), NOT per step
+const VEL_CLAMP  = 50;           // m/s per particle
+const NP         = 36;           // rope particles
+const SLACK      = 1.08;         // rest length / span -> catenary sag = 0.178 * span
+const SNAP_STRAIN= 0.25;         // dragline silk breaks near 27% strain
+const YIELD_STRAIN = 0.02;       // visible whitening/thinning starts here
+
+const V_LAUNCH   = 30;           // m/s baseline muzzle speed
+const V_LAUNCH_MAX = 48;
+const V_GAIN     = 2.0;          // m/s of launch speed per m/s of hand speed along the aim
+const DRAG_K0    = 0.030;        // quadratic drag, 1/m (20 mm / 4.6 g glob + filament payout)
+const DRAG_KS    = 7e-4;         // skin-friction growth per metre of line paid out
+const MIN_TRAVEL = 0.40;         // m before an edge can catch the web
+const MAX_FLIGHT = 12;           // m of arc before the web gives up
+const PAYOUT     = 0.14;         // m of travel between rope breadcrumbs
+
+const CABLE_R0   = 0.0062;       // cable radius at the hand end (m)
+const CABLE_R1   = 0.0046;       // at the anchor
+const HELIX_LAM  = 0.135;        // helix pitch (m)
+const HELIX_N    = 3;            // strands in the braid
+const SAMPLES    = 72;           // rendered samples along a cable
+
+const FOV_H      = 60 * Math.PI / 180;
+const Z_NEAR     = 0.20;
+const FLOOR_Y    = 1.15;         // camera sits ~1.15 m above the floor
+const CEIL_Y     = -1.30;
+const WALL_X     = 2.20;
+const PALM_M     = 0.092;        // wrist -> middle MCP, metres (fallback only)
+
+const EXT_ON     = 1.6, EXT_OFF = 1.25;
+const ARM_FRAMES = 3, BREAK_FRAMES = 4, LOST_MS = 400;
+const VEL_WINDOW = 150, VEL_CAP = 48;
+const LIFE_MS    = 25000, LIFE_FADE = 4000, FIZZLE_FADE = 1500;
+const SKEL_MS    = 10000;
+const GLOB_SPEED = 3.0;          // m/s hand speed for a flick
+const GLOB_HOLD  = 150;          // ms
+const EDGE_MS    = 120, EDGE_THRESH = 0.28;
+const SW         = 160;          // small-frame width for edge + ego-motion
+const DEPTH_MS   = 200;
+const POOL       = 24, SPLAT_POOL = 40, SPRAY_POOL = 220;
+
+const TIP = [4, 8, 12, 16, 20];
+const HAND_LINKS = [0,1,1,2,2,3,3,4,0,5,5,6,6,7,7,8,5,9,9,10,10,11,11,12,
+                    9,13,13,14,14,15,15,16,13,17,17,18,18,19,19,20,0,17];
+
+/* --------------------------------- utils -------------------------------- */
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp  = (a, b, t) => a + (b - a) * t;
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function showMessage(text) {
+  const m = document.getElementById('msg');
+  m.textContent = text; m.style.display = 'flex';
+}
+
+/* ------------------------------- surfaces ------------------------------- */
+const video   = document.getElementById('cam');
+const videoCv = document.getElementById('videoCanvas');
+const splatCv = document.getElementById('splatCanvas');
+const webCv   = document.getElementById('webCanvas');
+const hudEl   = document.getElementById('hud');
+const chipEl  = document.getElementById('depthChip');
+const vctx = videoCv.getContext('2d');
+const sctx = splatCv.getContext('2d');
+const wctx = webCv.getContext('2d');
+
+let CW = 0, CH = 0;
+const layout = { scale: 1, ox: 0, oy: 0, vw: 1280, vh: 720 };
+
+function updateLayout() {
+  const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+  layout.vw = vw; layout.vh = vh;
+  layout.scale = Math.max(CW / vw, CH / vh);
+  layout.ox = (CW - vw * layout.scale) / 2;
+  layout.oy = (CH - vh * layout.scale) / 2;
+  Cam3D.update();
+}
+function resize() {
+  CW = Math.max(1, window.innerWidth); CH = Math.max(1, window.innerHeight);
+  for (const c of [videoCv, splatCv, webCv]) { c.width = CW; c.height = CH; }
+  SmallFrame.resize();
+  updateLayout();
+}
+window.addEventListener('resize', resize);
+
+/* Mirrored ingestion: MediaPipe works in un-mirrored video space, the video is
+   drawn mirrored, so every landmark is converted once, here, and nothing
+   downstream ever thinks about it again. */
+const toScreenX = nx => layout.ox + (1 - nx) * layout.vw * layout.scale;
+const toScreenY = ny => layout.oy + ny * layout.vh * layout.scale;
+
+/* --------------------------------- Camera -------------------------------- */
+const Camera = {
+  async start() {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false
+    });
+    video.srcObject = stream;
+    try { await video.play(); } catch (e) { /* still decodes for canvas */ }
+    if (!video.videoWidth) {
+      await new Promise(r => video.addEventListener('loadedmetadata', r, { once: true }));
+    }
+    updateLayout();
+  },
+  drawMirrored(ctx, w, h) {
+    const s = layout.scale;
+    ctx.save();
+    ctx.translate(w, 0);
+    ctx.scale(-w / CW, h / CH);
+    ctx.drawImage(video, layout.ox, layout.oy, layout.vw * s, layout.vh * s);
+    ctx.restore();
+  }
+};
+
+/* --------------------------------- Cam3D --------------------------------- */
+/* Pinhole camera. Focal length comes from the webcam's horizontal field of
+   view applied to the on-screen width of the whole video frame, so the
+   projection matches what the user actually sees through the crop. */
+const Cam3D = {
+  f: 1000, cx: 0, cy: 0,
+  update() {
+    this.f = 0.5 * (layout.vw * layout.scale) / Math.tan(FOV_H / 2);
+    this.cx = CW / 2; this.cy = CH / 2;
+  },
+  px(x, z) { return this.cx + x * this.f / z; },
+  py(y, z) { return this.cy + y * this.f / z; },
+  ux(sx, z) { return (sx - this.cx) * z / this.f; },
+  uy(sy, z) { return (sy - this.cy) * z / this.f; },
+  /* Metres per screen pixel at depth z, for sizing things drawn flat. */
+  mpp(z) { return z / this.f; }
+};
+
+/* ------------------------------- SmallFrame ------------------------------ */
+/* One downscaled greyscale copy of the mirrored frame per rAF tick, shared by
+   the edge map and the ego-motion estimator. Aspect matches the screen so
+   both can treat it as a uniform scale of screen space. */
+const SmallFrame = (() => {
+  const cv = document.createElement('canvas');
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  let w = SW, h = 90;
+  let cur = new Uint8Array(1), prev = new Uint8Array(1), has = false, hasPrev = false;
+
+  function resize() {
+    w = SW; h = Math.max(24, Math.round(SW * CH / Math.max(1, CW)));
+    cv.width = w; cv.height = h;
+    cur = new Uint8Array(w * h); prev = new Uint8Array(w * h);
+    has = false; hasPrev = false;
+  }
+  function grab() {
+    if (!video.videoWidth) return false;
+    const t = prev; prev = cur; cur = t;              // recycle, no allocation
+    hasPrev = has;
+    Camera.drawMirrored(ctx, w, h);
+    const d = ctx.getImageData(0, 0, w, h).data;
+    for (let i = 0, p = 0; i < cur.length; i++, p += 4) {
+      cur[i] = (d[p] * 77 + d[p + 1] * 150 + d[p + 2] * 29) >> 8;
+    }
+    has = true;
+    return true;
+  }
+  return {
+    resize, grab,
+    get w() { return w; }, get h() { return h; },
+    get cur() { return cur; }, get prev() { return prev; },
+    get ready() { return has; }, get pairReady() { return has && hasPrev; },
+    get k() { return CW / w; }                        // small px -> screen px
+  };
+})();
+
+/* -------------------------------- EdgeMap -------------------------------- */
+/* Sobel gradient magnitude, normalised against the strongest edge in view, so
+   the threshold means "a reasonably strong edge for this room" rather than an
+   absolute luminance step. Webs catch on doorframes, not on blank wall. */
+const EdgeMap = (() => {
+  let mag = new Float32Array(1), mw = 0, mh = 0, ready = false, last = -1e9;
+
+  function update(now) {
+    if (now - last < EDGE_MS || !SmallFrame.ready) return;
+    last = now;
+    const w = SmallFrame.w, h = SmallFrame.h, g = SmallFrame.cur;
+    if (mw !== w || mh !== h) { mw = w; mh = h; mag = new Float32Array(w * h); }
+    mag.fill(0);
+    let max = 0;
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const i = y * w + x;
+        const a = g[i - w - 1], b = g[i - w], c = g[i - w + 1];
+        const e = g[i - 1],                   f = g[i + 1];
+        const p = g[i + w - 1], q = g[i + w], r = g[i + w + 1];
+        const gx = (c + 2 * f + r) - (a + 2 * e + p);
+        const gy = (p + 2 * q + r) - (a + 2 * b + c);
+        const m = Math.sqrt(gx * gx + gy * gy);
+        mag[i] = m; if (m > max) max = m;
+      }
+    }
+    const inv = 1 / Math.max(max, 150);        // floor stops blank walls lighting up
+    for (let i = 0; i < mag.length; i++) mag[i] *= inv;
+    ready = true;
+  }
+  function sample(sx, sy) {
+    if (!ready) return 0;
+    const gx = clamp(sx / CW * mw - 0.5, 0, mw - 1.001);
+    const gy = clamp(sy / CH * mh - 0.5, 0, mh - 1.001);
+    const x0 = gx | 0, y0 = gy | 0, fx = gx - x0, fy = gy - y0;
+    const i = y0 * mw + x0;
+    return (mag[i] * (1 - fx) + mag[i + 1] * fx) * (1 - fy) +
+           (mag[i + mw] * (1 - fx) + mag[i + mw + 1] * fx) * fy;
+  }
+  return { update, sample, isReady: () => ready };
+})();
+
+/* ------------------------------- EgoMotion ------------------------------- */
+/* Anchors must stay on the wall when the laptop gets nudged. We estimate the
+   global image similarity (translation, rotation, zoom) by block matching,
+   reject the user's own body as outliers, then re-project every world-fixed
+   3D point so it lands on the same real-world pixel it did last frame. */
+const EgoMotion = (() => {
+  const GX = 9, GY = 7, NB = GX * GY;         // block grid
+  const BS = 12, STEP = 2, RAD = 6;           // block size, sample stride, search radius
+  const bx = new Float32Array(NB), by = new Float32Array(NB);
+  const dx = new Float32Array(NB), dy = new Float32Array(NB);
+  const okB = new Uint8Array(NB);
+  const sorted = new Float32Array(NB);
+  let sim = { s: 1, th: 0, tx: 0, ty: 0, valid: false };
+
+  function median(arr, n) {
+    for (let i = 0; i < n; i++) sorted[i] = arr[i];
+    // insertion sort: n <= 63, and only on inlier candidates
+    for (let i = 1; i < n; i++) {
+      const v = sorted[i]; let j = i - 1;
+      while (j >= 0 && sorted[j] > v) { sorted[j + 1] = sorted[j]; j--; }
+      sorted[j + 1] = v;
+    }
+    return n & 1 ? sorted[(n - 1) >> 1] : 0.5 * (sorted[n / 2 - 1] + sorted[n / 2]);
+  }
+
+  function estimate(hands) {
+    sim.valid = false;
+    if (!SmallFrame.pairReady) return sim;
+    const w = SmallFrame.w, h = SmallFrame.h;
+    const cur = SmallFrame.cur, prv = SmallFrame.prev;
+    const half = BS >> 1, k = SmallFrame.k;
+    let n = 0;
+
+    for (let gy = 0; gy < GY; gy++) {
+      for (let gx = 0; gx < GX; gx++) {
+        const cxp = Math.round((gx + 1) * w / (GX + 1));
+        const cyp = Math.round((gy + 1) * h / (GY + 1));
+        if (cxp - half - RAD < 0 || cxp + half + RAD >= w ||
+            cyp - half - RAD < 0 || cyp + half + RAD >= h) continue;
+        // Skip blocks sitting on the user's hands — they are the loudest
+        // non-rigid motion in frame and would poison the fit.
+        let onHand = false;
+        for (const hd of hands) {
+          if (!hd.present) continue;
+          if (Math.abs(cxp * k - hd.wx) < 150 && Math.abs(cyp * k - hd.wy) < 150) { onHand = true; break; }
+        }
+        if (onHand) continue;
+
+        let bestSad = Infinity, bestU = 0, bestV = 0, second = Infinity;
+        for (let v = -RAD; v <= RAD; v++) {
+          for (let u = -RAD; u <= RAD; u++) {
+            let sad = 0;
+            for (let yy = -half; yy < half; yy += STEP) {
+              const ra = (cyp + yy) * w + cxp, rb = (cyp + yy + v) * w + cxp + u;
+              for (let xx = -half; xx < half; xx += STEP) {
+                const d = prv[ra + xx] - cur[rb + xx];
+                sad += d < 0 ? -d : d;
+              }
+            }
+            if (sad < bestSad) { second = bestSad; bestSad = sad; bestU = u; bestV = v; }
+            else if (sad < second) second = sad;
+          }
+        }
+        // Ambiguous match (flat wall, repeating texture) -> no vote.
+        if (!(second > bestSad * 1.06)) continue;
+        bx[n] = cxp; by[n] = cyp; dx[n] = bestU; dy[n] = bestV; okB[n] = 1; n++;
+      }
+    }
+    if (n < 10) return sim;
+
+    // Robust core: median translation, then keep only blocks that agree.
+    const mdx = median(dx, n), mdy = median(dy, n);
+    let m = 0;
+    for (let i = 0; i < n; i++) {
+      if (Math.abs(dx[i] - mdx) <= 1.5 && Math.abs(dy[i] - mdy) <= 1.5) {
+        bx[m] = bx[i]; by[m] = by[i]; dx[m] = dx[i]; dy[m] = dy[i]; m++;
+      }
+    }
+    if (m < 8) return sim;
+
+    // Closed-form least-squares similarity over the inliers.
+    let mx = 0, my = 0, mxp = 0, myp = 0;
+    for (let i = 0; i < m; i++) { mx += bx[i]; my += by[i]; mxp += bx[i] + dx[i]; myp += by[i] + dy[i]; }
+    mx /= m; my /= m; mxp /= m; myp /= m;
+    let a = 0, b = 0, den = 0;
+    for (let i = 0; i < m; i++) {
+      const qx = bx[i] - mx, qy = by[i] - my;
+      const rx = bx[i] + dx[i] - mxp, ry = by[i] + dy[i] - myp;
+      a += qx * rx + qy * ry;
+      b += qx * ry - qy * rx;
+      den += qx * qx + qy * qy;
+    }
+    if (den < 1e-6) return sim;
+    const th = Math.atan2(b, a);
+    const s = Math.hypot(a, b) / den;
+    if (!isFinite(s) || s < 0.9 || s > 1.1) return sim;
+    const cos = Math.cos(th), sin = Math.sin(th);
+    const tx = (mxp - s * (cos * mx - sin * my)) * k;
+    const ty = (myp - s * (sin * mx + cos * my)) * k;
+
+    // Deadband: never let sensor noise drift the world.
+    const driftX = tx + (s * cos - 1) * Cam3D.cx - s * sin * Cam3D.cy;
+    const driftY = ty + s * sin * Cam3D.cx + (s * cos - 1) * Cam3D.cy;
+    if (Math.abs(driftX) < 0.45 && Math.abs(driftY) < 0.45 &&
+        Math.abs(th) < 0.0015 && Math.abs(s - 1) < 0.0015) return sim;
+
+    sim.s = s; sim.th = th; sim.tx = tx; sim.ty = ty; sim.valid = true;
+    return sim;
+  }
+
+  /* Move one world-fixed point from the old camera frame into the new one by
+     insisting it keeps projecting to the same piece of the real world.
+       u' = s*R(th)*u + T   (centred image coords)   and   z' = z/s
+     which is exact for the observed image motion by construction. */
+  const P = { x: 0, y: 0, z: 0 };
+  function apply(x, y, z) {
+    const f = Cam3D.f, cx = Cam3D.cx, cy = Cam3D.cy;
+    const cos = Math.cos(sim.th), sin = Math.sin(sim.th), s = sim.s;
+    const u = x * f / z, v = y * f / z;                       // centred image coords
+    const Tx = s * (cos * cx - sin * cy) + sim.tx - cx;
+    const Ty = s * (sin * cx + cos * cy) + sim.ty - cy;
+    const up = s * (cos * u - sin * v) + Tx;
+    const vp = s * (sin * u + cos * v) + Ty;
+    const zp = z / s;
+    P.x = up * zp / f; P.y = vp * zp / f; P.z = zp;
+    return P;
+  }
+  return { estimate, apply, get sim() { return sim; } };
+})();
+
+/* --------------------------------- Scene --------------------------------- */
+/* A single webcam gives no true geometry, so the room is modelled as a box
+   around the camera: floor, ceiling, two side walls and a back wall that
+   backs off as the user reaches further from the lens. Depth along any pixel
+   ray is the box exit distance, which is exactly the form a depth map takes —
+   so switching the ML depth model on later swaps one function, not the
+   physics. */
+const Scene = (() => {
+  let backZ = 3.0;
+
+  function calibrate(handZ) {
+    const want = clamp(handZ + 1.8, 2.2, 5.0);
+    backZ += (want - backZ) * 0.02;            // drift slowly, never snap
+  }
+  /* Depth of the modelled surface along the view ray through a screen pixel. */
+  function depthAt(sx, sy) {
+    if (DepthMode.active) {
+      const z = DepthMode.metricAt(sx, sy);
+      if (z > 0) return z;
+    }
+    const dx = (sx - Cam3D.cx) / Cam3D.f, dy = (sy - Cam3D.cy) / Cam3D.f;
+    let t = backZ;                              // ray is (dx, dy, 1) * t
+    if (dy > 1e-6) t = Math.min(t, FLOOR_Y / dy);
+    if (dy < -1e-6) t = Math.min(t, CEIL_Y / dy);
+    if (dx > 1e-6) t = Math.min(t, WALL_X / dx);
+    if (dx < -1e-6) t = Math.min(t, -WALL_X / dx);
+    return t;                                   // z component of (dx,dy,1)*t is t
+  }
+  return { calibrate, depthAt, get backZ() { return backZ; } };
+})();
+
+/* ------------------------------- DepthMode ------------------------------- */
+/* Optional upgrade: a monocular depth model turns the room box into the real
+   room. Relative inverse depth is calibrated to metres using the one point we
+   already know the distance of — the user's own hand. */
+const DepthMode = (() => {
+  const cv = document.createElement('canvas');
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  cv.width = 256; cv.height = 144;
+  let status = 'off', pipe = null, RawImageCls = null;
+  let busy = false, last = -1e9, loading = false, dead = false, wanted = false;
+  let map = null, mw = 0, mh = 0, scale = 0;
+
+  function setChip() {
+    if (status === 'off') { chipEl.style.display = 'none'; return; }
+    chipEl.style.display = 'block';
+    chipEl.textContent = status === 'warming' ? 'DEPTH: warming up…'
+                       : status === 'on' ? 'DEPTH: ON' : 'DEPTH: unavailable';
+  }
+  async function load() {
+    loading = true; status = 'warming'; setChip();
+    try {
+      const mod = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.1');
+      RawImageCls = mod.RawImage;
+      try {
+        pipe = await mod.pipeline('depth-estimation', 'onnx-community/depth-anything-v2-small', { device: 'webgpu' });
+      } catch (e) {
+        pipe = await mod.pipeline('depth-estimation', 'onnx-community/depth-anything-v2-small', { device: 'wasm' });
+      }
+      status = wanted ? 'on' : 'off';
+    } catch (e) { status = 'unavailable'; dead = true; pipe = null; }
+    loading = false; setChip();
+  }
+  function toggle() {
+    if (dead) return;
+    if (status === 'off') {
+      wanted = true;
+      if (!pipe && !loading) load(); else status = pipe ? 'on' : 'warming';
+    } else { wanted = false; status = 'off'; }
+    setChip();
+  }
+  function tick(now) {
+    if (status !== 'on' || !pipe || busy || now - last < DEPTH_MS || !video.videoWidth) return;
+    last = now; busy = true;
+    Camera.drawMirrored(ctx, cv.width, cv.height);
+    const id = ctx.getImageData(0, 0, cv.width, cv.height);
+    (async () => {
+      try {
+        const out = await pipe(new RawImageCls(id.data, cv.width, cv.height, 4));
+        const dm = out && out.depth;
+        if (dm && dm.data) {
+          const ch = dm.channels || 1;
+          if (!map || mw !== dm.width || mh !== dm.height) {
+            mw = dm.width; mh = dm.height; map = new Float32Array(mw * mh);
+          }
+          for (let i = 0; i < mw * mh; i++) map[i] = dm.data[i * ch] / 255;
+        }
+      } catch (e) { status = 'unavailable'; dead = true; setChip(); }
+      finally { busy = false; }
+    })();
+  }
+  /* One-point calibration: inverse depth d maps to metric z as z = scale / d,
+     fixed by the hand whose metric depth we measured from its apparent size. */
+  function calibrate(sx, sy, z) {
+    if (!map || z <= 0) return;
+    const d = raw(sx, sy);
+    if (d > 0.05) {
+      const want = z * d;
+      scale = scale > 0 ? scale + (want - scale) * 0.1 : want;
+    }
+  }
+  function raw(sx, sy) {
+    if (!map) return 0;
+    const x = clamp((sx / CW * mw) | 0, 0, mw - 1);
+    const y = clamp((sy / CH * mh) | 0, 0, mh - 1);
+    return map[y * mw + x];
+  }
+  function metricAt(sx, sy) {
+    if (!map || scale <= 0) return 0;
+    const d = raw(sx, sy);
+    if (d < 0.02) return 12;
+    return clamp(scale / d, 0.3, 12);
+  }
+  return {
+    toggle, tick, calibrate, metricAt,
+    get active() { return status === 'on' && !!map && scale > 0; },
+    get status() { return status; }
+  };
+})();
+
+/* ---------------------------------- Sfx ---------------------------------- */
+const Sfx = (() => {
+  let ctx = null, master = null, noise = null;
+  function ensure() {
+    if (ctx) { if (ctx.state === 'suspended') ctx.resume(); return true; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return false;
+    try {
+      ctx = new AC();
+      master = ctx.createGain(); master.gain.value = 0.8; master.connect(ctx.destination);
+      const len = (ctx.sampleRate * 0.5) | 0;
+      noise = ctx.createBuffer(1, len, ctx.sampleRate);
+      const ch = noise.getChannelData(0);
+      for (let i = 0; i < len; i++) ch[i] = Math.random() * 2 - 1;
+      if (ctx.state === 'suspended') ctx.resume();
+      return true;
+    } catch (e) { ctx = null; return false; }
+  }
+  const unlock = () => { if (ctx && ctx.state === 'suspended') ctx.resume(); };
+  window.addEventListener('pointerdown', unlock);
+  window.addEventListener('keydown', unlock);
+
+  function thwip(pitch = 1) {
+    if (!ensure()) return;
+    const t = ctx.currentTime;
+    const src = ctx.createBufferSource(); src.buffer = noise;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass'; bp.Q.value = 5.5;
+    bp.frequency.setValueAtTime(3000 * pitch, t);
+    bp.frequency.exponentialRampToValueAtTime(800 * pitch, t + 0.09);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.55, t);
+    g.gain.exponentialRampToValueAtTime(0.0008, t + 0.09);
+    src.connect(bp).connect(g).connect(master);
+    src.start(t); src.stop(t + 0.1);
+
+    const osc = ctx.createOscillator(); osc.type = 'sine';
+    osc.frequency.setValueAtTime(500 * pitch, t);
+    osc.frequency.exponentialRampToValueAtTime(150 * pitch, t + 0.04);
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(0.28, t);
+    g2.gain.exponentialRampToValueAtTime(0.0008, t + 0.04);
+    osc.connect(g2).connect(master);
+    osc.start(t); osc.stop(t + 0.05);
+  }
+  function thap() {
+    if (!ensure()) return;
+    const t = ctx.currentTime;
+    const src = ctx.createBufferSource(); src.buffer = noise;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.setValueAtTime(520, t); lp.Q.value = 0.7;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.2, t);
+    g.gain.exponentialRampToValueAtTime(0.0006, t + 0.07);
+    src.connect(lp).connect(g).connect(master);
+    src.start(t); src.stop(t + 0.08);
+  }
+  return { thwip, thap };
+})();
+
+/* -------------------------------- Tracker -------------------------------- */
+const Tracker = (() => {
+  let landmarker = null, lastVideoTime = -1, lastTs = -1;
+
+  async function init() {
+    const BASE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+    let vision = null, err = null;
+    for (const url of [BASE, BASE + '/vision_bundle.mjs']) {
+      try {
+        const m = await import(url);
+        if (m && m.HandLandmarker && m.FilesetResolver) { vision = m; break; }
+      } catch (e) { err = e; }
+    }
+    if (!vision) throw err || new Error('tasks-vision unavailable');
+    const { HandLandmarker, FilesetResolver } = vision;
+    const fileset = await FilesetResolver.forVisionTasks(BASE + '/wasm');
+    const opts = {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU'
+      },
+      runningMode: 'VIDEO', numHands: 2
+    };
+    try { landmarker = await HandLandmarker.createFromOptions(fileset, opts); }
+    catch (e) {
+      opts.baseOptions.delegate = 'CPU';
+      landmarker = await HandLandmarker.createFromOptions(fileset, opts);
+    }
+  }
+  function detect(now) {
+    if (!landmarker || video.readyState < 2 || !video.videoWidth) return null;
+    if (video.currentTime === lastVideoTime) return null;
+    lastVideoTime = video.currentTime;
+    const ts = Math.max(now, lastTs + 1);
+    lastTs = ts;
+    try { return landmarker.detectForVideo(video, ts); } catch (e) { return null; }
+  }
+  return { init, detect };
+})();
+
+/* ------------------------------- GestureFSM ------------------------------ */
+/* Two persistent hand slots. Detections are matched to slots by proximity,
+   with handedness only as a tiebreak, so identity survives label flicker when
+   the hands cross. */
+function makeHand(id) {
+  return {
+    id, present: false, seenEver: false, label: '',
+    lm: new Float32Array(42),
+    wx: 0, wy: 0,                                   // wrist, screen px
+    x: 0, y: 0, z: 0.7,                             // wrist, metres
+    px: 0, py: 0, pz: 0.7,                          // previous frame, for pin interpolation
+    ax: 0, ay: 0, az: 1,                            // aim, unit, scene frame
+    vx: 0, vy: 0, vz: 0, speed: 0,                  // wrist velocity, m/s
+    zRaw: 0.7, zHas: false,
+    ext: new Uint8Array(4),
+    state: 'IDLE', poseFrames: 0, breakFrames: 0, poseStart: 0,
+    lastSeen: -1e9, web: -1,
+    bufX: new Float64Array(VEL_CAP), bufY: new Float64Array(VEL_CAP),
+    bufZ: new Float64Array(VEL_CAP), bufT: new Float64Array(VEL_CAP),
+    bufN: 0, bufHead: 0,
+    flash: 0, flashX: 0, flashY: 0, flashDX: 1, flashDY: 0
+  };
+}
+const hands = [makeHand(0), makeHand(1)];
+
+/* Least-squares slope over the last 150 ms: a single-frame delta is far too
+   noisy to drive launch speed. */
+function computeVelocity(h, now) {
+  let n = 0, sT = 0, sTT = 0, sX = 0, sY = 0, sZ = 0, sTX = 0, sTY = 0, sTZ = 0;
+  for (let k = 0; k < h.bufN; k++) {
+    const i = (h.bufHead - 1 - k + VEL_CAP * 2) % VEL_CAP;
+    const dt = (h.bufT[i] - now) / 1000;
+    if (dt < -VEL_WINDOW / 1000) break;
+    n++; sT += dt; sTT += dt * dt;
+    sX += h.bufX[i]; sY += h.bufY[i]; sZ += h.bufZ[i];
+    sTX += dt * h.bufX[i]; sTY += dt * h.bufY[i]; sTZ += dt * h.bufZ[i];
+  }
+  const den = n * sTT - sT * sT;
+  if (n < 3 || Math.abs(den) < 1e-9) { h.vx = h.vy = h.vz = h.speed = 0; return; }
+  h.vx = (n * sTX - sT * sX) / den;
+  h.vy = (n * sTY - sT * sY) / den;
+  h.vz = (n * sTZ - sT * sZ) / den;
+  h.speed = Math.hypot(h.vx, h.vy, h.vz);
+}
+
+/* Finger extension as a ratio of the palm, measured in the metric hand rather
+   than on screen. A hand aimed straight down the lens projects its whole
+   length into a few pixels, so screen-space ratios collapse exactly when the
+   user is doing the one gesture that matters most; in 3D the ratio is
+   invariant to every orientation. */
+function updateFingers(h, world) {
+  let S, dist;
+  if (world && world.length >= 21) {
+    const w0 = world[0], w9 = world[9];
+    S = Math.hypot(w9.x - w0.x, w9.y - w0.y, w9.z - w0.z);
+    dist = i => {
+      const p = world[i];
+      return Math.hypot(p.x - w0.x, p.y - w0.y, p.z - w0.z);
+    };
+  } else {
+    const lm = h.lm, wx = lm[0], wy = lm[1];
+    S = Math.hypot(lm[18] - wx, lm[19] - wy);
+    dist = i => Math.hypot(h.lm[i * 2] - wx, h.lm[i * 2 + 1] - wy);
+  }
+  if (S < 1e-5) return;
+  for (let f = 1; f < 5; f++) {
+    const E = dist(TIP[f]) / S;
+    if (E > EXT_ON) h.ext[f - 1] = 1;
+    else if (E < EXT_OFF) h.ext[f - 1] = 0;            // between: hold previous
+  }
+}
+const isThwipPose = h => h.ext[0] === 1 && h.ext[3] === 1 && h.ext[1] === 0 && h.ext[2] === 0;
+
+/* Lift the hand into metres.
+
+   Depth: worldLandmarks give the hand's true size in metres, so the ratio of
+   how big it is to how big it looks is its distance. Fitting that scale by
+   least squares across all 21 landmarks — rather than off one bone — is what
+   keeps it stable when the hand points straight at the lens, which is exactly
+   when any single bone foreshortens to nothing.
+
+   Aim: the hand's pointing direction from worldLandmarks, rotated 180 degrees
+   about the vertical axis — (x,y,z) -> (-x,y,-z). That single rigid rotation
+   does two jobs at once: it mirrors X to match the selfie view, and it makes
+   a palm aimed at the camera fire *into* the room the user can see, which is
+   the whole fantasy. Gravity is on Y so the rotation leaves the physics
+   untouched. */
+function liftTo3D(h, world) {
+  const lm = h.lm;
+  const Spx = Math.hypot(lm[18] - lm[0], lm[19] - lm[1]);
+  let z = h.zRaw;
+  if (world && world.length >= 21) {
+    /* Solve the wrist depth under full perspective rather than assuming the
+       whole hand sits at one depth. A landmark offset (dx,dy,dz) from the
+       wrist lands at du = (f*dx - ex*dz) / (Z + dz), which rearranges to
+       du*Z = f*dx - ex*dz - du*dz: linear in Z, so all 40 equations fall out
+       as one least squares. The single-scale approximation is worth ~11% at
+       arm's length with the palm aimed down the lens, which is precisely the
+       pose this whole thing is built around.
+       Position is a real camera measurement and keeps the true depth axis;
+       only the aim below takes the 180 degree gameplay rotation. */
+    const f = Cam3D.f, w0 = world[0];
+    const ex = h.wx - Cam3D.cx, ey = h.wy - Cam3D.cy;
+    let num = 0, den = 0;
+    for (let i = 1; i < 21; i++) {
+      const dx = -(world[i].x - w0.x);              // screen x runs against the model's
+      const dy = world[i].y - w0.y;
+      const dz = world[i].z - w0.z;
+      const ox = lm[i * 2] - h.wx, oy = lm[i * 2 + 1] - h.wy;
+      num += ox * (f * dx - ex * dz - ox * dz) + oy * (f * dy - ey * dz - oy * dz);
+      den += ox * ox + oy * oy;
+    }
+    if (den > 400) {                                // hand big enough on screen to trust
+      const zf = num / den;
+      if (zf > 0.05 && zf < 6) z = zf;
+    } else if (Spx > 4) z = f * PALM_M / Spx;
+    const w9 = world[9];
+    const ux = w9.x - w0.x, uy = w9.y - w0.y, uz = w9.z - w0.z;
+    const L = Math.hypot(ux, uy, uz);
+    if (L > 1e-4) { h.ax = -ux / L; h.ay = uy / L; h.az = -uz / L; }
+  } else {
+    if (Spx > 4) z = Cam3D.f * PALM_M / Spx;
+    // No metric hand: aim along the screen-space palm axis, tilted into the room.
+    let dx = lm[18] - lm[0], dy = lm[19] - lm[1];
+    const dl = Math.hypot(dx, dy) || 1;
+    const sx = dx / dl * 0.94, sy = dy / dl * 0.94;
+    const n = Math.hypot(sx, sy, 0.35) || 1;
+    h.ax = sx / n; h.ay = sy / n; h.az = 0.35 / n;
+  }
+  z = clamp(z, 0.25, 2.2);
+  h.zRaw = h.zHas ? h.zRaw + (z - h.zRaw) * 0.35 : z;   // depth from apparent size is jittery
+  h.zHas = true;
+  h.px = h.x; h.py = h.y; h.pz = h.z;
+  h.z = h.zRaw;
+  h.x = Cam3D.ux(h.wx, h.z);
+  h.y = Cam3D.uy(h.wy, h.z);
+}
+
+function assignHands(res, now) {
+  for (const h of hands) h.present = false;
+  if (!res || !res.landmarks || !res.landmarks.length) return;
+  const taken = [false, false];
+  const n = Math.min(res.landmarks.length, 2);
+  for (let i = 0; i < n; i++) {
+    const lms = res.landmarks[i];
+    if (!lms || lms.length < 21) continue;
+    const hd = res.handednesses || res.handedness;
+    const label = (hd && hd[i] && hd[i][0]) ? hd[i][0].categoryName : '';
+    const wx = toScreenX(lms[0].x), wy = toScreenY(lms[0].y);
+
+    let best = -1, bestScore = Infinity;
+    for (let s = 0; s < 2; s++) {
+      if (taken[s]) continue;
+      const h = hands[s];
+      const fresh = h.seenEver && (now - h.lastSeen) < 500;
+      const d = fresh ? Math.hypot(wx - h.wx, wy - h.wy) : Infinity;
+      const score = (fresh && d < 400) ? d
+        : 1e5 + (h.seenEver && h.label === label ? 0 : 1e4) + (h.seenEver ? 0 : -5e3);
+      if (score < bestScore) { bestScore = score; best = s; }
+    }
+    if (best < 0) continue;
+    taken[best] = true;
+    const h = hands[best];
+    for (let k = 0; k < 21; k++) {
+      h.lm[k * 2] = toScreenX(lms[k].x);
+      h.lm[k * 2 + 1] = toScreenY(lms[k].y);
+    }
+    h.present = true; h.seenEver = true; h.label = label; h.lastSeen = now;
+    h.wx = h.lm[0]; h.wy = h.lm[1];
+    const world = (res.worldLandmarks && res.worldLandmarks[i]) || null;
+    liftTo3D(h, world);
+    h.bufX[h.bufHead] = h.x; h.bufY[h.bufHead] = h.y; h.bufZ[h.bufHead] = h.z;
+    h.bufT[h.bufHead] = now;
+    h.bufHead = (h.bufHead + 1) % VEL_CAP;
+    if (h.bufN < VEL_CAP) h.bufN++;
+    computeVelocity(h, now);
+    updateFingers(h, world);
+    Scene.calibrate(h.z);
+    DepthMode.calibrate(h.wx, h.wy, h.z);
+  }
+}
+
+/* Advanced once per detection frame — a 30 fps camera under a 60 fps loop
+   must not double-count the debounce. */
+function stepFSM(h, now) {
+  if (!h.present) return;
+  const pose = isThwipPose(h);
+  if (pose) { if (h.poseFrames === 0) h.poseStart = now; h.poseFrames++; h.breakFrames = 0; }
+  else { h.breakFrames++; h.poseFrames = 0; }
+
+  switch (h.state) {
+    case 'IDLE':
+      if (pose) h.state = 'ARMING';
+      break;
+    case 'ARMING':
+      if (!pose) h.state = 'IDLE';
+      else if (h.poseFrames >= ARM_FRAMES) { WebPhysics.fire(h, now); h.state = 'HELD'; }
+      break;
+    case 'HELD':
+      if (h.breakFrames >= BREAK_FRAMES) { WebPhysics.release(h, now); h.state = 'IDLE'; }
+      break;
+  }
+}
+function checkTrackingLoss(h, now) {
+  if (now - h.lastSeen <= LOST_MS) return;
+  h.present = false;
+  if (h.state === 'HELD') WebPhysics.release(h, now);
+  if (h.state !== 'IDLE') { h.state = 'IDLE'; h.poseFrames = 0; h.breakFrames = 0; }
+  h.vx = h.vy = h.vz = h.speed = 0; h.bufN = 0; h.bufHead = 0; h.zHas = false;
+}
+
+/* --------------------------------- Splats -------------------------------- */
+/* Impacts are world-fixed 3D points carrying a pre-rendered sprite, so they
+   shrink with distance, ride out camera movement, and cost one drawImage. */
+const Splats = (() => {
+  const items = [];
+  for (let i = 0; i < SPLAT_POOL; i++) {
+    items.push({ active: false, x: 0, y: 0, z: 1, r: 0.1, born: 0, sprite: null, alpha: 1 });
+  }
+  function add(x, y, z, worldR, fibers, seed, now) {
+    let s = items.find(i => !i.active);
+    if (!s) { s = items[0]; for (const i of items) if (i.born < s.born) s = i; }
+    s.active = true; s.x = x; s.y = y; s.z = z; s.r = worldR; s.born = now; s.alpha = 1;
+    s.sprite = Renderer.makeSplatSprite(fibers, seed);
+    return s;
+  }
+  function update(now) {
+    for (const s of items) {
+      if (!s.active) continue;
+      const age = now - s.born;
+      s.alpha = age < LIFE_MS - LIFE_FADE ? 1 : 1 - (age - (LIFE_MS - LIFE_FADE)) / LIFE_FADE;
+      if (s.alpha <= 0) { s.active = false; s.sprite = null; }
+    }
+  }
+  function transform() {
+    for (const s of items) {
+      if (!s.active) continue;
+      const p = EgoMotion.apply(s.x, s.y, s.z);
+      s.x = p.x; s.y = p.y; s.z = p.z;
+    }
+  }
+  return { items, add, update, transform };
+})();
+
+/* --------------------------------- Spray --------------------------------- */
+/* The fluid that misses: a cone of droplets at the muzzle and a burst at the
+   impact. Short-lived, fully 3D, drawn as swept streaks. */
+const Spray = (() => {
+  const n = SPRAY_POOL;
+  const x = new Float32Array(n), y = new Float32Array(n), z = new Float32Array(n);
+  const vx = new Float32Array(n), vy = new Float32Array(n), vz = new Float32Array(n);
+  const life = new Float32Array(n), max = new Float32Array(n), rad = new Float32Array(n);
+  let head = 0;
+
+  function emit(px, py, pz, dx, dy, dz, count, speed, spread, rnd) {
+    for (let i = 0; i < count; i++) {
+      const k = head; head = (head + 1) % n;
+      const a = rnd() * 6.2832, r = Math.sqrt(rnd()) * spread;
+      // Build a spread cone around the shot axis.
+      let ux = -dy, uy = dx, uz = 0;
+      let ul = Math.hypot(ux, uy, uz);
+      if (ul < 1e-4) { ux = 1; uy = 0; uz = 0; ul = 1; }
+      ux /= ul; uy /= ul; uz /= ul;
+      const wx2 = dy * uz - dz * uy, wy2 = dz * ux - dx * uz, wz2 = dx * uy - dy * ux;
+      const ox = Math.cos(a) * r, oy = Math.sin(a) * r;
+      const sp = speed * (0.45 + rnd() * 0.85);
+      x[k] = px; y[k] = py; z[k] = pz;
+      vx[k] = (dx + ux * ox + wx2 * oy) * sp;
+      vy[k] = (dy + uy * ox + wy2 * oy) * sp;
+      vz[k] = (dz + uz * ox + wz2 * oy) * sp;
+      max[k] = life[k] = 0.22 + rnd() * 0.3;
+      rad[k] = 0.0025 + rnd() * 0.004;
+    }
+  }
+  function step(dt) {
+    for (let i = 0; i < n; i++) {
+      if (life[i] <= 0) continue;
+      life[i] -= dt;
+      const v = Math.hypot(vx[i], vy[i], vz[i]);
+      const k = 0.12 * v * dt;                 // droplets are small: they bleed speed fast
+      vx[i] -= vx[i] * k; vy[i] -= vy[i] * k; vz[i] -= vz[i] * k;
+      vy[i] += GRAV * dt;
+      x[i] += vx[i] * dt; y[i] += vy[i] * dt; z[i] += vz[i] * dt;
+    }
+  }
+  function transform() {
+    for (let i = 0; i < n; i++) {
+      if (life[i] <= 0) continue;
+      const p = EgoMotion.apply(x[i], y[i], z[i]);
+      x[i] = p.x; y[i] = p.y; z[i] = p.z;
+    }
+  }
+  return { emit, step, transform, x, y, z, vx, vy, vz, life, max, rad, n };
+})();
+
+/* ------------------------------- WebPhysics ------------------------------ */
+const WebPhysics = (() => {
+  const TCAP = 128;
+  const pool = [];
+  for (let i = 0; i < POOL; i++) {
+    pool.push({
+      active: false, phase: 0, glob: false, hand: -1,
+      tx: 0, ty: 0, tz: 1, tvx: 0, tvy: 0, tvz: 0,
+      lx: 0, ly: 0, lz: 1,                       // tip one substep ago, for the streak
+      arc: 0, travel: 0, since: 0,
+      trX: new Float32Array(TCAP), trY: new Float32Array(TCAP), trZ: new Float32Array(TCAP), trN: 0,
+      px: new Float32Array(NP), py: new Float32Array(NP), pz: new Float32Array(NP),
+      ox: new Float32Array(NP), oy: new Float32Array(NP), oz: new Float32Array(NP),
+      restSeg: 0, restTotal: 0, ax: 0, ay: 0, az: 1,
+      pin0: false, pinEnd: false, strain: 0,
+      born: 0, fadeStart: Infinity, fadeDur: LIFE_FADE, alpha: 1,
+      seed: 1, filPhase: 0
+    });
+  }
+  const polyX = new Float32Array(TCAP + 8), polyY = new Float32Array(TCAP + 8), polyZ = new Float32Array(TCAP + 8);
+  let seedC = 1;
+
+  function acquire() {
+    for (const w of pool) if (!w.active) return w;
+    let o = pool[0];
+    for (const w of pool) if (w.born < o.born) o = w;
+    if (o.hand >= 0) hands[o.hand].web = -1;
+    return o;
+  }
+
+  function fire(h, now) {
+    const along = h.vx * h.ax + h.vy * h.ay + h.vz * h.az;
+    const v0 = clamp(V_LAUNCH + V_GAIN * Math.max(0, along), V_LAUNCH, V_LAUNCH_MAX);
+    const glob = h.speed > GLOB_SPEED && (now - h.poseStart) < GLOB_HOLD;
+
+    const w = acquire();
+    w.active = true; w.glob = glob; w.phase = glob ? 2 : 0;
+    w.hand = glob ? -1 : h.id;
+    // Leave from just past the wrist, along the shot axis.
+    w.tx = w.lx = h.x + h.ax * 0.04;
+    w.ty = w.ly = h.y + h.ay * 0.04;
+    w.tz = w.lz = h.z + h.az * 0.04;
+    w.tvx = h.ax * v0; w.tvy = h.ay * v0; w.tvz = h.az * v0;
+    w.arc = 0; w.travel = 0; w.since = 0;
+    w.trX[0] = w.tx; w.trY[0] = w.ty; w.trZ[0] = w.tz; w.trN = 1;
+    w.born = now; w.fadeStart = Infinity; w.fadeDur = LIFE_FADE; w.alpha = 1;
+    w.pin0 = false; w.pinEnd = false; w.strain = 0;
+    w.seed = seedC = (seedC * 1664525 + 1013904223) >>> 0;
+    w.filPhase = (w.seed % 628) / 100;
+    if (!glob) h.web = pool.indexOf(w);
+
+    Sfx.thwip(glob ? 1.55 : 1);
+    h.flash = 3; h.flashX = h.wx; h.flashY = h.wy;
+    const dl = Math.hypot(h.ax, h.ay) || 1;
+    h.flashDX = h.ax / dl; h.flashDY = h.ay / dl;
+    const rnd = mulberry32(w.seed);
+    Spray.emit(w.tx, w.ty, w.tz, h.ax, h.ay, h.az, 14, v0 * 0.32, 0.42, rnd);
+  }
+
+  function release(h, now) {
+    const idx = h.web; h.web = -1;
+    if (idx < 0) return;
+    const w = pool[idx];
+    if (!w.active || w.hand !== h.id) return;
+    w.hand = -1; w.pinEnd = false;
+    if (w.phase !== 1) { fizzle(w, now); return; }
+    // Hand the wrist's velocity to the free end (per substep, not per frame,
+    // or the rope leaves with 26x too much energy).
+    w.ox[NP - 1] = w.px[NP - 1] - h.vx * H;
+    w.oy[NP - 1] = w.py[NP - 1] - h.vy * H;
+    w.oz[NP - 1] = w.pz[NP - 1] - h.vz * H;
+    w.fadeStart = Math.min(w.fadeStart, now);
+    w.fadeDur = LIFE_FADE;
+  }
+
+  function fizzle(w, now) {
+    const h = w.hand >= 0 ? hands[w.hand] : null;
+    buildRope(w, w.tx, w.ty, w.tz,
+              h ? h.x : w.trX[0], h ? h.y : w.trY[0], h ? h.z : w.trZ[0], false);
+    w.phase = 1; w.pin0 = false; w.pinEnd = false;
+    w.fadeStart = now; w.fadeDur = FIZZLE_FADE;
+    if (w.hand >= 0) { hands[w.hand].web = -1; w.hand = -1; }
+  }
+
+  /* Resample [anchor .. breadcrumbs .. wrist] into NP evenly spaced particles
+     so the rope inherits the shape the fluid was actually laid down along. */
+  function buildRope(w, ax, ay, az, hx, hy, hz, anchored) {
+    let n = 0;
+    polyX[n] = ax; polyY[n] = ay; polyZ[n] = az; n++;
+    for (let i = w.trN - 1; i >= 0; i--) {
+      const dx = w.trX[i] - polyX[n - 1], dy = w.trY[i] - polyY[n - 1], dz = w.trZ[i] - polyZ[n - 1];
+      if (dx * dx + dy * dy + dz * dz < 1e-4) continue;
+      polyX[n] = w.trX[i]; polyY[n] = w.trY[i]; polyZ[n] = w.trZ[i]; n++;
+    }
+    if (Math.hypot(hx - polyX[n - 1], hy - polyY[n - 1], hz - polyZ[n - 1]) > 0.01) {
+      polyX[n] = hx; polyY[n] = hy; polyZ[n] = hz; n++;
+    }
+    if (n === 1) { polyX[1] = hx; polyY[1] = hy; polyZ[1] = hz; n = 2; }
+
+    let total = 0;
+    for (let i = 0; i < n - 1; i++) {
+      total += Math.hypot(polyX[i + 1] - polyX[i], polyY[i + 1] - polyY[i], polyZ[i + 1] - polyZ[i]);
+    }
+    const step = total / (NP - 1);
+    let seg = 0, run = 0;
+    let segLen = Math.hypot(polyX[1] - polyX[0], polyY[1] - polyY[0], polyZ[1] - polyZ[0]);
+    for (let i = 0; i < NP; i++) {
+      const want = i * step;
+      while (seg < n - 2 && run + segLen < want) {
+        run += segLen; seg++;
+        segLen = Math.hypot(polyX[seg + 1] - polyX[seg], polyY[seg + 1] - polyY[seg], polyZ[seg + 1] - polyZ[seg]);
+      }
+      const t = segLen > 1e-6 ? clamp((want - run) / segLen, 0, 1) : 0;
+      w.px[i] = w.ox[i] = lerp(polyX[seg], polyX[seg + 1], t);
+      w.py[i] = w.oy[i] = lerp(polyY[seg], polyY[seg + 1], t);
+      w.pz[i] = w.oz[i] = lerp(polyZ[seg], polyZ[seg + 1], t);
+    }
+    w.ax = ax; w.ay = ay; w.az = az;
+    w.restTotal = Math.max(SLACK * Math.hypot(ax - hx, ay - hy, az - hz), 0.08);
+    w.restSeg = w.restTotal / (NP - 1);
+    w.pin0 = anchored;
+  }
+
+  function anchor(w, x, y, z, now) {
+    const h = w.hand >= 0 ? hands[w.hand] : null;
+    const rnd = mulberry32(w.seed ^ 0x9e3779b9);
+    const nvx = -w.tvx, nvy = -w.tvy, nvz = -w.tvz;
+    const nl = Math.hypot(nvx, nvy, nvz) || 1;
+    Spray.emit(x, y, z, nvx / nl, nvy / nl, nvz / nl, w.glob ? 10 : 6, 1.6, 0.9, rnd);
+    Splats.add(x, y, z, (w.glob ? 0.105 : 0.058), w.glob ? 14 : 9 + (w.seed % 3), w.seed, now);
+    Sfx.thap();
+    if (w.glob) { w.active = false; return; }
+    buildRope(w, x, y, z, h ? h.x : w.trX[0], h ? h.y : w.trY[0], h ? h.z : w.trZ[0], true);
+    w.phase = 1;
+    w.pinEnd = h !== null;
+    w.born = now;
+    w.fadeStart = now + (LIFE_MS - LIFE_FADE);
+    w.fadeDur = LIFE_FADE;
+  }
+
+  /* True quadratic drag: at 30 m/s a 20 mm glob is at Re ~ 4e4, squarely in
+     the flat Cd region, and the line it drags behind it costs momentum too. */
+  function stepFlight(w, now) {
+    w.lx = w.tx; w.ly = w.ty; w.lz = w.tz;
+    const v = Math.hypot(w.tvx, w.tvy, w.tvz);
+    const k = (DRAG_K0 + DRAG_KS * w.arc) * v;
+    w.tvx -= w.tvx * k * H;
+    w.tvy -= w.tvy * k * H;
+    w.tvz -= w.tvz * k * H;
+    w.tvy += GRAV * H;
+    w.tx += w.tvx * H; w.ty += w.tvy * H; w.tz += w.tvz * H;
+
+    const step = Math.hypot(w.tx - w.lx, w.ty - w.ly, w.tz - w.lz);
+    w.arc += step; w.travel += step; w.since += step;
+    if (!w.glob && w.since >= PAYOUT && w.trN < TCAP) {
+      w.trX[w.trN] = w.tx; w.trY[w.trN] = w.ty; w.trZ[w.trN] = w.tz; w.trN++;
+      w.since = 0;
+    }
+    // Flew past the viewer, or off the edge of the world.
+    if (w.tz < Z_NEAR || w.arc > MAX_FLIGHT) { endFlight(w, now); return; }
+    const sx = Cam3D.px(w.tx, w.tz), sy = Cam3D.py(w.ty, w.tz);
+    if (sx < -60 || sy < -60 || sx > CW + 60 || sy > CH + 60) { endFlight(w, now); return; }
+
+    // Caught on visible structure: a doorframe, a shelf edge, a monitor bezel.
+    if (w.travel >= MIN_TRAVEL && EdgeMap.isReady() && EdgeMap.sample(sx, sy) > EDGE_THRESH) {
+      anchor(w, w.tx, w.ty, w.tz, now); return;
+    }
+    // Hit the surface the scene model puts along this view ray.
+    if (w.tz >= Scene.depthAt(sx, sy)) {
+      let a = 0, b = 1;                        // bisect back to the contact point
+      for (let i = 0; i < 5; i++) {
+        const m = (a + b) * 0.5;
+        const mx = lerp(w.lx, w.tx, m), my = lerp(w.ly, w.ty, m), mz = lerp(w.lz, w.tz, m);
+        if (mz >= Scene.depthAt(Cam3D.px(mx, mz), Cam3D.py(my, mz))) b = m; else a = m;
+      }
+      anchor(w, lerp(w.lx, w.tx, b), lerp(w.ly, w.ty, b), lerp(w.lz, w.tz, b), now);
+    }
+  }
+  function endFlight(w, now) {
+    if (w.glob) { w.active = false; return; }
+    fizzle(w, now);
+  }
+
+  /* Verlet with distance constraints. Small steps, few iterations: 8 substeps
+     x 2 iterations is an order of magnitude stiffer than 1 step x 16 for the
+     same work, and damping is stored as a rate so changing the substep count
+     never silently changes how alive the rope feels. */
+  const DAMP = Math.exp(-ROPE_C * H);
+  const GH2 = GRAV * H * H;
+  const VMAX = VEL_CLAMP * H;
+  function stepRope(w, pinX, pinY, pinZ) {
+    const px = w.px, py = w.py, pz = w.pz, ox = w.ox, oy = w.oy, oz = w.oz;
+    for (let i = 0; i < NP; i++) {
+      const cx = px[i], cy = py[i], cz = pz[i];
+      let dx = (cx - ox[i]) * DAMP, dy = (cy - oy[i]) * DAMP, dz = (cz - oz[i]) * DAMP;
+      const d = Math.hypot(dx, dy, dz);
+      if (d > VMAX) { const s = VMAX / d; dx *= s; dy *= s; dz *= s; }
+      px[i] = cx + dx; py[i] = cy + dy + GH2; pz[i] = cz + dz;
+      ox[i] = cx; oy[i] = cy; oz[i] = cz;
+    }
+    if (w.pin0) { px[0] = w.ax; py[0] = w.ay; pz[0] = w.az; }
+    if (w.pinEnd) { px[NP - 1] = pinX; py[NP - 1] = pinY; pz[NP - 1] = pinZ; }
+
+    const rest = w.restSeg;
+    for (let it = 0; it < ITER; it++) {
+      for (let i = 0; i < NP - 1; i++) {
+        const dx = px[i + 1] - px[i], dy = py[i + 1] - py[i], dz = pz[i + 1] - pz[i];
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (d < 1e-9) continue;
+        const diff = (d - rest) / d;
+        const aF = (i === 0 && w.pin0), bF = (i + 1 === NP - 1 && w.pinEnd);
+        if (aF && bF) continue;
+        if (aF) { px[i + 1] -= dx * diff; py[i + 1] -= dy * diff; pz[i + 1] -= dz * diff; }
+        else if (bF) { px[i] += dx * diff; py[i] += dy * diff; pz[i] += dz * diff; }
+        else {
+          const hx = dx * diff * 0.5, hy = dy * diff * 0.5, hz = dz * diff * 0.5;
+          px[i] += hx; py[i] += hy; pz[i] += hz;
+          px[i + 1] -= hx; py[i + 1] -= hy; pz[i + 1] -= hz;
+        }
+      }
+      if (w.pin0) { px[0] = w.ax; py[0] = w.ay; pz[0] = w.az; }
+      if (w.pinEnd) { px[NP - 1] = pinX; py[NP - 1] = pinY; pz[NP - 1] = pinZ; }
+    }
+  }
+
+  /* a is the position of this substep inside the frame, so the pinned end
+     sweeps with the hand instead of teleporting to it once per frame. */
+  function substep(now, a) {
+    for (const w of pool) {
+      if (!w.active) continue;
+      if (w.phase !== 1) { stepFlight(w, now); continue; }
+      let hx = 0, hy = 0, hz = 0;
+      if (w.pinEnd && w.hand >= 0) {
+        const h = hands[w.hand];
+        hx = lerp(h.px, h.x, a); hy = lerp(h.py, h.y, a); hz = lerp(h.pz, h.z, a);
+      } else if (w.pinEnd) w.pinEnd = false;
+      stepRope(w, hx, hy, hz);
+    }
+  }
+
+  function updateState(now) {
+    for (const w of pool) {
+      if (!w.active) continue;
+      if (w.phase === 1 && w.restTotal > 0.01) {
+        const span = Math.hypot(w.px[NP - 1] - w.px[0], w.py[NP - 1] - w.py[0], w.pz[NP - 1] - w.pz[0]);
+        w.strain = Math.max(0, span / w.restTotal - 1);
+        // Silk yields around 2% and parts near 27%: pulling hard enough
+        // rips the line off your hand rather than stretching it like rubber.
+        if (w.strain > SNAP_STRAIN && w.pinEnd) {
+          const h = w.hand >= 0 ? hands[w.hand] : null;
+          if (h) { h.web = -1; }
+          w.hand = -1; w.pinEnd = false;
+          w.fadeStart = Math.min(w.fadeStart, now); w.fadeDur = LIFE_FADE;
+          Sfx.thap();
+        }
+      }
+      if (now >= w.fadeStart) {
+        w.alpha = 1 - clamp((now - w.fadeStart) / w.fadeDur, 0, 1);
+        if (w.alpha <= 0) {
+          w.active = false;
+          if (w.hand >= 0) { hands[w.hand].web = -1; w.hand = -1; }
+        }
+      } else w.alpha = 1;
+    }
+  }
+
+  function transform() {
+    for (const w of pool) {
+      if (!w.active) continue;
+      if (w.phase === 1) {
+        for (let i = 0; i < NP; i++) {
+          let p = EgoMotion.apply(w.px[i], w.py[i], w.pz[i]);
+          const nx = p.x, ny = p.y, nz = p.z;
+          p = EgoMotion.apply(w.ox[i], w.oy[i], w.oz[i]);
+          w.ox[i] = p.x; w.oy[i] = p.y; w.oz[i] = p.z;   // move history too, or we inject velocity
+          w.px[i] = nx; w.py[i] = ny; w.pz[i] = nz;
+        }
+        const a = EgoMotion.apply(w.ax, w.ay, w.az);
+        w.ax = a.x; w.ay = a.y; w.az = a.z;
+      } else {
+        let p = EgoMotion.apply(w.tx, w.ty, w.tz);
+        w.tx = p.x; w.ty = p.y; w.tz = p.z;
+        p = EgoMotion.apply(w.lx, w.ly, w.lz);
+        w.lx = p.x; w.ly = p.y; w.lz = p.z;
+        for (let i = 0; i < w.trN; i++) {
+          p = EgoMotion.apply(w.trX[i], w.trY[i], w.trZ[i]);
+          w.trX[i] = p.x; w.trY[i] = p.y; w.trZ[i] = p.z;
+        }
+      }
+    }
+  }
+
+  const liveCount = () => { let n = 0; for (const w of pool) if (w.active) n++; return n; };
+  return { pool, fire, release, substep, updateState, transform, liveCount };
+})();
+
+/* -------------------------------- Renderer ------------------------------- */
+/* A web line is not a stroke. It is a tube: it has a silhouette that thickens
+   as it comes towards you, a lit side and a shaded side, and three filaments
+   braided around it whose twist foreshortens with depth and which disappear
+   behind the tube on the far side of every turn. All of that is computed in
+   3D and projected, which is why it reads as a cable running into the room
+   rather than a line drawn on the glass. */
+const Renderer = (() => {
+  const M = SAMPLES, CAP = M + 8;
+  const cx3 = new Float32Array(CAP), cy3 = new Float32Array(CAP), cz3 = new Float32Array(CAP);
+  const tx3 = new Float32Array(CAP), ty3 = new Float32Array(CAP), tz3 = new Float32Array(CAP);
+  const nx3 = new Float32Array(CAP), ny3 = new Float32Array(CAP), nz3 = new Float32Array(CAP);
+  const bx3 = new Float32Array(CAP), by3 = new Float32Array(CAP), bz3 = new Float32Array(CAP);
+  const sxA = new Float32Array(CAP), syA = new Float32Array(CAP);
+  const rpA = new Float32Array(CAP), rwA = new Float32Array(CAP);
+  const uxA = new Float32Array(CAP), uyA = new Float32Array(CAP), arcA = new Float32Array(CAP);
+  const srcX = new Float32Array(160), srcY = new Float32Array(160), srcZ = new Float32Array(160);
+  const LX = -0.52, LY = -0.85;                 // screen-space key light, upper left
+
+  /* Catmull-Rom resample of an arbitrary-length 3D polyline to M samples. */
+  function smooth3(sx, sy, sz, n) {
+    if (n < 2) return 0;
+    for (let j = 0; j < M; j++) {
+      const u = j / (M - 1) * (n - 1);
+      const i = Math.min(n - 2, u | 0), t = u - i;
+      const i0 = i > 0 ? i - 1 : 0, i3 = i + 2 < n ? i + 2 : n - 1;
+      const t2 = t * t, t3 = t2 * t;
+      const c0 = -t3 + 2 * t2 - t, c1 = 3 * t3 - 5 * t2 + 2, c2 = -3 * t3 + 4 * t2 + t, c3 = t3 - t2;
+      cx3[j] = 0.5 * (c0 * sx[i0] + c1 * sx[i] + c2 * sx[i + 1] + c3 * sx[i3]);
+      cy3[j] = 0.5 * (c0 * sy[i0] + c1 * sy[i] + c2 * sy[i + 1] + c3 * sy[i3]);
+      cz3[j] = 0.5 * (c0 * sz[i0] + c1 * sz[i] + c2 * sz[i + 1] + c3 * sz[i3]);
+    }
+    return M;
+  }
+
+  /* Tangents, arc length, and a rotation-minimising frame. Frenet frames flip
+     at inflection points and would make the braid visibly snap. */
+  function frames(n) {
+    arcA[0] = 0;
+    for (let i = 0; i < n; i++) {
+      const a = i > 0 ? i - 1 : 0, b = i < n - 1 ? i + 1 : n - 1;
+      let dx = cx3[b] - cx3[a], dy = cy3[b] - cy3[a], dz = cz3[b] - cz3[a];
+      const l = Math.hypot(dx, dy, dz) || 1;
+      tx3[i] = dx / l; ty3[i] = dy / l; tz3[i] = dz / l;
+      if (i > 0) arcA[i] = arcA[i - 1] + Math.hypot(cx3[i] - cx3[i - 1], cy3[i] - cy3[i - 1], cz3[i] - cz3[i - 1]);
+    }
+    let ax = Math.abs(tx3[0]) < 0.9 ? 1 : 0, ay = Math.abs(tx3[0]) < 0.9 ? 0 : 1, az = 0;
+    let d = ax * tx3[0] + ay * ty3[0] + az * tz3[0];
+    let px = ax - tx3[0] * d, py = ay - ty3[0] * d, pz = az - tz3[0] * d;
+    let pl = Math.hypot(px, py, pz) || 1;
+    px /= pl; py /= pl; pz /= pl;
+    for (let i = 0; i < n; i++) {
+      d = px * tx3[i] + py * ty3[i] + pz * tz3[i];
+      let qx = px - tx3[i] * d, qy = py - ty3[i] * d, qz = pz - tz3[i] * d;
+      const ql = Math.hypot(qx, qy, qz) || 1;
+      qx /= ql; qy /= ql; qz /= ql;
+      nx3[i] = px = qx; ny3[i] = py = qy; nz3[i] = pz = qz;
+      bx3[i] = ty3[i] * qz - tz3[i] * qy;
+      by3[i] = tz3[i] * qx - tx3[i] * qz;
+      bz3[i] = tx3[i] * qy - ty3[i] * qx;
+    }
+  }
+
+  /* Project, size by depth, and find the run of samples in front of the lens. */
+  let runA = 0, runB = 0;
+  function projectRun(n, r0, r1, thin) {
+    runA = -1; runB = -1;
+    for (let i = 0; i < n; i++) {
+      const z = cz3[i];
+      if (z <= Z_NEAR) { if (runA >= 0 && runB < 0) runB = i - 1; continue; }
+      if (runA < 0) runA = i;
+      if (runB < 0) runB = i;
+      else if (i === runB + 1) runB = i;
+      sxA[i] = Cam3D.px(cx3[i], z);
+      syA[i] = Cam3D.py(cy3[i], z);
+      const t = n > 1 ? i / (n - 1) : 0;
+      // Ease the radius down over the last few samples so the ends read as a
+      // rounded cap rather than a cleanly sawn-off tube.
+      const endK = Math.min(1, Math.min(i, n - 1 - i) / 5);
+      rwA[i] = lerp(r0, r1, t) * thin * (0.58 + 0.42 * endK);
+      rpA[i] = clamp(rwA[i] * Cam3D.f / z, 0.7, 11);
+    }
+    if (runA < 0 || runB <= runA) return false;
+    for (let i = runA; i <= runB; i++) {
+      const a = i > runA ? i - 1 : runA, b = i < runB ? i + 1 : runB;
+      let dx = sxA[b] - sxA[a], dy = syA[b] - syA[a];
+      const l = Math.hypot(dx, dy) || 1;
+      uxA[i] = -dy / l; uyA[i] = dx / l;      // 2D normal to the projected axis
+    }
+    return true;
+  }
+
+  /* A ribbon between two signed offsets along the projected normal. */
+  function ribbon(ctx, a, b, lo, hi, style) {
+    ctx.beginPath();
+    for (let i = a; i <= b; i++) {
+      const x = sxA[i] + uxA[i] * lo[i], y = syA[i] + uyA[i] * lo[i];
+      if (i === a) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    for (let i = b; i >= a; i--) {
+      ctx.lineTo(sxA[i] + uxA[i] * hi[i], syA[i] + uyA[i] * hi[i]);
+    }
+    ctx.closePath();
+    ctx.fillStyle = style;
+    ctx.fill();
+  }
+  const loBuf = new Float32Array(CAP), hiBuf = new Float32Array(CAP);
+
+  function drawCable(ctx, n, alpha, tension, phase, r0, r1, thin) {
+    if (!projectRun(n, r0, r1, thin)) return;
+    const a = runA, b = runB;
+    if (b - a < 1) return;
+
+    // Soft bloom. A stroke, not a ribbon: a ribbon polygon self-intersects
+    // wherever the cable folds back on itself and fills as a solid patch.
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(sxA[a], syA[a]);
+    for (let i = a + 1; i <= b; i++) ctx.lineTo(sxA[i], syA[i]);
+    ctx.lineWidth = rpA[(a + b) >> 1] * 4.2;
+    ctx.strokeStyle = 'rgba(210,225,255,' + (0.075 * alpha) + ')';
+    ctx.stroke();
+
+    // Core silhouette.
+    for (let i = a; i <= b; i++) { loBuf[i] = -rpA[i]; hiBuf[i] = rpA[i]; }
+    const cr = Math.round(lerp(233, 252, tension));
+    const cg = Math.round(lerp(238, 253, tension));
+    const cb = Math.round(lerp(247, 255, tension));
+    ribbon(ctx, a, b, loBuf, hiBuf, 'rgba(' + cr + ',' + cg + ',' + cb + ',' + (0.97 * alpha) + ')');
+
+    // Shaded side, then the specular side: two bands are enough to read as a
+    // lit cylinder, and they track the light as the cable curves.
+    for (let i = a; i <= b; i++) {
+      const dot = uxA[i] * LX + uyA[i] * LY;
+      const c = -dot * 0.72 * rpA[i];
+      loBuf[i] = c - rpA[i] * 0.26; hiBuf[i] = c + rpA[i] * 0.26;
+    }
+    ribbon(ctx, a, b, loBuf, hiBuf, 'rgba(126,138,164,' + (0.4 * alpha) + ')');
+    for (let i = a; i <= b; i++) {
+      const dot = uxA[i] * LX + uyA[i] * LY;
+      const c = dot * 0.55 * rpA[i];
+      loBuf[i] = c - rpA[i] * 0.2; hiBuf[i] = c + rpA[i] * 0.2;
+    }
+    ribbon(ctx, a, b, loBuf, hiBuf, 'rgba(255,255,255,' + (0.85 * alpha) + ')');
+
+    // Braid: three filaments wound around the tube. Each is split into the
+    // arcs facing us and the arcs on the far side, so the twist actually
+    // passes behind the cable instead of sliding over it.
+    const k = 6.2832 / HELIX_LAM;
+    for (let s = 0; s < HELIX_N; s++) {
+      const off = phase + s * 6.2832 / HELIX_N;
+      ctx.beginPath();
+      let pen = false;
+      for (let i = a; i <= b; i++) {                    // far side first
+        const ph = arcA[i] * k + off;
+        const co = Math.cos(ph), si = Math.sin(ph);
+        const oz = (co * nz3[i] + si * bz3[i]) * rwA[i] * 0.8;
+        if (oz <= 0) { pen = false; continue; }
+        const ox = (co * nx3[i] + si * bx3[i]) * rwA[i] * 0.8;
+        const oy = (co * ny3[i] + si * by3[i]) * rwA[i] * 0.8;
+        const z = cz3[i] + oz;
+        if (z <= Z_NEAR) { pen = false; continue; }
+        const x = Cam3D.px(cx3[i] + ox, z), y = Cam3D.py(cy3[i] + oy, z);
+        if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
+      }
+      ctx.lineWidth = Math.max(0.6, rpA[(a + b) >> 1] * 0.22);
+      ctx.strokeStyle = 'rgba(192,203,224,' + (0.24 * alpha) + ')';
+      ctx.stroke();
+
+      ctx.beginPath();
+      pen = false;
+      for (let i = a; i <= b; i++) {                    // near side over the top
+        const ph = arcA[i] * k + off;
+        const co = Math.cos(ph), si = Math.sin(ph);
+        const oz = (co * nz3[i] + si * bz3[i]) * rwA[i] * 0.8;
+        if (oz > 0) { pen = false; continue; }
+        const ox = (co * nx3[i] + si * bx3[i]) * rwA[i] * 0.8;
+        const oy = (co * ny3[i] + si * by3[i]) * rwA[i] * 0.8;
+        const z = cz3[i] + oz;
+        if (z <= Z_NEAR) { pen = false; continue; }
+        const x = Cam3D.px(cx3[i] + ox, z), y = Cam3D.py(cy3[i] + oy, z);
+        if (pen) ctx.lineTo(x, y); else { ctx.moveTo(x, y); pen = true; }
+      }
+      ctx.lineWidth = Math.max(0.65, rpA[(a + b) >> 1] * 0.26);
+      ctx.strokeStyle = 'rgba(255,255,255,' + (0.46 * alpha) + ')';
+      ctx.stroke();
+    }
+
+    // Stray fibres. Web fluid is not extruded plastic.
+    const rnd = mulberry32(((phase * 1000) | 0) ^ 0x5bf03635);
+    ctx.beginPath();
+    for (let i = a + 2; i <= b - 2; i += 7) {
+      const ang = rnd() * 6.2832, len = rpA[i] * (1.6 + rnd() * 2.2);
+      const dx = Math.cos(ang), dy = Math.sin(ang);
+      ctx.moveTo(sxA[i], syA[i]);
+      ctx.quadraticCurveTo(sxA[i] + dx * len * 0.6 - uxA[i] * len * 0.3,
+                           syA[i] + dy * len * 0.6 - uyA[i] * len * 0.3,
+                           sxA[i] + dx * len, syA[i] + dy * len);
+    }
+    ctx.lineWidth = 0.7;
+    ctx.strokeStyle = 'rgba(255,255,255,' + (0.3 * alpha) + ')';
+    ctx.stroke();
+  }
+
+  function drawWeb(ctx, w) {
+    if (w.alpha <= 0.004) return;
+    if (w.phase === 1) {
+      const n = smooth3(w.px, w.py, w.pz, NP);
+      frames(n);
+      const tension = clamp(w.strain / YIELD_STRAIN, 0, 1);
+      const thin = 1 - 0.45 * Math.min(w.strain, 0.3);      // Poisson thinning
+      drawCable(ctx, n, w.alpha, tension, w.filPhase, CABLE_R1, CABLE_R0, thin);
+      return;
+    }
+    // In flight: the line is still being extruded, so it runs hand -> tip and
+    // tapers to the glob at the front.
+    let n = 0;
+    const h = w.hand >= 0 ? hands[w.hand] : null;
+    if (h) { srcX[n] = h.x; srcY[n] = h.y; srcZ[n] = h.z; n++; }
+    for (let i = 0; i < w.trN && n < 150; i++) { srcX[n] = w.trX[i]; srcY[n] = w.trY[i]; srcZ[n] = w.trZ[i]; n++; }
+    srcX[n] = w.tx; srcY[n] = w.ty; srcZ[n] = w.tz; n++;
+    if (!w.glob && n >= 2) {
+      const m = smooth3(srcX, srcY, srcZ, n);
+      frames(m);
+      drawCable(ctx, m, w.alpha, 0, w.filPhase, CABLE_R0 * 0.85, 0.0045, 1);
+    }
+    drawGlob(ctx, w);
+  }
+
+  /* At 30 m/s the head covers half a metre between frames: draw the swept
+     segment, never a lone dot, or it strobes. */
+  function drawGlob(ctx, w) {
+    if (w.tz <= Z_NEAR) return;
+    const r = clamp((w.glob ? 0.028 : 0.014) * Cam3D.f / w.tz, 1.5, 60);
+    const x = Cam3D.px(w.tx, w.tz), y = Cam3D.py(w.ty, w.tz);
+    let lx = x, ly = y;
+    if (w.lz > Z_NEAR) { lx = Cam3D.px(w.lx, w.lz); ly = Cam3D.py(w.ly, w.lz); }
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(232,238,250,' + (0.55 * w.alpha) + ')';
+    ctx.lineWidth = r * 1.5;
+    ctx.beginPath(); ctx.moveTo(lx, ly); ctx.lineTo(x, y); ctx.stroke();
+    ctx.fillStyle = 'rgba(250,252,255,' + (0.96 * w.alpha) + ')';
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.9 * w.alpha) + ')';
+    ctx.beginPath(); ctx.arc(x - r * 0.3, y - r * 0.35, r * 0.42, 0, 6.2832); ctx.fill();
+  }
+
+  /* Impact: a splatter of fluid that grabs the surface. Central mass, curved
+     tapering fibres, a few connecting threads that hint at a web rosette, and
+     the droplets that bounced. Seeded, so no two are alike. */
+  function makeSplatSprite(fibers, seed) {
+    const R = 72, S = R * 2;
+    const cv = document.createElement('canvas');
+    cv.width = S; cv.height = S;
+    const c = cv.getContext('2d');
+    const rnd = mulberry32(seed >>> 0);
+    const cxp = R, cyp = R;
+    c.fillStyle = 'rgba(242,246,252,0.5)';
+    for (let i = 0; i < 4; i++) {
+      const rr = R * (0.15 + rnd() * 0.1);
+      c.beginPath();
+      c.arc(cxp + (rnd() - 0.5) * R * 0.2, cyp + (rnd() - 0.5) * R * 0.2, rr, 0, 6.2832);
+      c.fill();
+    }
+    const base = rnd() * 6.2832;
+    const ex = new Float32Array(fibers), ey = new Float32Array(fibers);
+    c.fillStyle = 'rgba(246,249,254,0.72)';
+    for (let i = 0; i < fibers; i++) {
+      const a = base + (i / fibers) * 6.2832 + (rnd() - 0.5) * 0.55;
+      const dx = Math.cos(a), dy = Math.sin(a);
+      const len = R * (0.4 + rnd() * 0.5), hw = R * 0.055;
+      const bend = (rnd() - 0.5) * len * 0.4;
+      const mx = cxp + dx * len * 0.5 - dy * bend, my = cyp + dy * len * 0.5 + dx * bend;
+      ex[i] = cxp + dx * len; ey[i] = cyp + dy * len;
+      c.beginPath();
+      c.moveTo(cxp - dy * hw, cyp + dx * hw);
+      c.quadraticCurveTo(mx - dy * hw * 0.5, my + dx * hw * 0.5, ex[i], ey[i]);
+      c.quadraticCurveTo(mx + dy * hw * 0.5, my - dx * hw * 0.5, cxp + dy * hw, cyp - dx * hw);
+      c.closePath(); c.fill();
+    }
+    c.strokeStyle = 'rgba(255,255,255,0.34)';
+    c.lineWidth = 1.2;
+    c.beginPath();
+    for (let i = 0; i < fibers; i++) {
+      if (rnd() > 0.55) continue;
+      const j = (i + 1) % fibers, t = 0.35 + rnd() * 0.3;
+      const x0 = lerp(cxp, ex[i], t), y0 = lerp(cyp, ey[i], t);
+      const x1 = lerp(cxp, ex[j], t), y1 = lerp(cyp, ey[j], t);
+      c.moveTo(x0, y0);
+      c.quadraticCurveTo(lerp(cxp, (x0 + x1) / 2, 1.25), lerp(cyp, (y0 + y1) / 2, 1.25), x1, y1);
+    }
+    c.stroke();
+    c.fillStyle = 'rgba(255,255,255,0.5)';
+    for (let i = 0; i < 5; i++) {
+      const a = rnd() * 6.2832, d = R * (0.5 + rnd() * 0.45);
+      c.beginPath();
+      c.arc(cxp + Math.cos(a) * d, cyp + Math.sin(a) * d, R * (0.02 + rnd() * 0.03), 0, 6.2832);
+      c.fill();
+    }
+    return cv;
+  }
+
+  function drawSplats(ctx) {
+    const list = Splats.items.filter(s => s.active && s.z > Z_NEAR);
+    list.sort((a, b) => b.z - a.z);                      // painter's order
+    for (const s of list) {
+      const r = s.r * Cam3D.f / s.z;
+      if (r < 0.8) continue;
+      const x = Cam3D.px(s.x, s.z), y = Cam3D.py(s.y, s.z);
+      if (x < -r * 2 || y < -r * 2 || x > CW + r * 2 || y > CH + r * 2) continue;
+      ctx.globalAlpha = s.alpha;
+      ctx.drawImage(s.sprite, x - r, y - r, r * 2, r * 2);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawSpray(ctx) {
+    ctx.lineCap = 'round';
+    for (let i = 0; i < Spray.n; i++) {
+      if (Spray.life[i] <= 0) continue;
+      const z = Spray.z[i];
+      if (z <= Z_NEAR) continue;
+      const a = clamp(Spray.life[i] / Spray.max[i], 0, 1);
+      const x = Cam3D.px(Spray.x[i], z), y = Cam3D.py(Spray.y[i], z);
+      const px = Cam3D.px(Spray.x[i] - Spray.vx[i] * 0.014, z);
+      const py = Cam3D.py(Spray.y[i] - Spray.vy[i] * 0.014, z);
+      ctx.strokeStyle = 'rgba(250,252,255,' + (0.75 * a) + ')';
+      ctx.lineWidth = clamp(Spray.rad[i] * 2 * Cam3D.f / z, 0.8, 9);
+      ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(x, y); ctx.stroke();
+    }
+  }
+
+  function drawHandFx(ctx, h) {
+    if (h.flash <= 0) return;
+    const a = h.flash / 3;
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(255,255,255,' + (0.85 * a) + ')';
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(h.flashX, h.flashY);
+    ctx.lineTo(h.flashX + h.flashDX * 30, h.flashY + h.flashDY * 30);
+    ctx.stroke();
+    const g = ctx.createRadialGradient(h.flashX, h.flashY, 0, h.flashX, h.flashY, 26);
+    g.addColorStop(0, 'rgba(255,255,255,' + (0.5 * a) + ')');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(h.flashX, h.flashY, 26, 0, 6.2832); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawSkeleton(ctx, h) {
+    ctx.save();
+    ctx.strokeStyle = 'rgba(200,220,255,0.12)';
+    ctx.fillStyle = 'rgba(200,220,255,0.12)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < HAND_LINKS.length; i += 2) {
+      const a = HAND_LINKS[i] * 2, b = HAND_LINKS[i + 1] * 2;
+      ctx.moveTo(h.lm[a], h.lm[a + 1]); ctx.lineTo(h.lm[b], h.lm[b + 1]);
+    }
+    ctx.stroke();
+    for (let i = 0; i < 21; i++) {
+      ctx.beginPath(); ctx.arc(h.lm[i * 2], h.lm[i * 2 + 1], 2, 0, 6.2832); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  return { drawWeb, drawSplats, drawSpray, drawHandFx, drawSkeleton, makeSplatSprite };
+})();
+
+/* --------------------------------- input --------------------------------- */
+let hudVisible = true;
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'h') { hudVisible = !hudVisible; hudEl.style.display = hudVisible ? 'block' : 'none'; }
+  else if (k === 'd') DepthMode.toggle();
+});
+
+/* -------------------------------- main loop ------------------------------- */
+let acc = 0, prevTime = 0, startTime = 0;
+let fps = 60, hudLast = 0;
+const order = [];
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  let dt = (now - prevTime) / 1000;
+  prevTime = now;
+  if (dt > 0.1) dt = 0.1;
+  fps += ((1 / Math.max(dt, 1e-4)) - fps) * 0.08;
+
+  // 1. the world as the user sees it
+  vctx.clearRect(0, 0, CW, CH);
+  if (video.readyState >= 2) Camera.drawMirrored(vctx, CW, CH);
+  const fresh = SmallFrame.grab();
+
+  // 2. hands, then gestures (detection frames only, so the debounce is honest)
+  const res = Tracker.detect(now);
+  if (res) {
+    assignHands(res, now);
+    for (const h of hands) stepFSM(h, now);
+  }
+  for (const h of hands) checkTrackingLoss(h, now);
+
+  // 3. did the camera move? if so, drag the world back onto its real pixels
+  if (fresh) {
+    const sim = EgoMotion.estimate(hands);
+    if (sim.valid) { WebPhysics.transform(); Splats.transform(); Spray.transform(); }
+  }
+
+  // 4. environment sampling, each on its own clock, never blocking
+  EdgeMap.update(now);
+  DepthMode.tick(now);
+
+  // 5. fixed-step physics; the pinned end sweeps with the hand across substeps
+  acc += dt;
+  const steps = Math.min(Math.floor(acc / H), MAX_SUB);
+  for (let i = 1; i <= steps; i++) { WebPhysics.substep(now, i / steps); acc -= H; }
+  if (acc >= H) acc %= H;                      // behind schedule: drop time, never spiral
+  Spray.step(dt);
+  WebPhysics.updateState(now);
+  Splats.update(now);
+
+  // 6. draw, far to near
+  sctx.clearRect(0, 0, CW, CH);
+  Renderer.drawSplats(sctx);
+
+  wctx.clearRect(0, 0, CW, CH);
+  order.length = 0;
+  for (const w of WebPhysics.pool) {
+    if (!w.active) continue;
+    w._key = w.phase === 1 ? w.pz[NP >> 1] : w.tz;
+    order.push(w);
+  }
+  order.sort((a, b) => b._key - a._key);
+  for (const w of order) Renderer.drawWeb(wctx, w);
+  Renderer.drawSpray(wctx);
+
+  let handCount = 0;
+  for (const h of hands) {
+    if (h.present) handCount++;
+    Renderer.drawHandFx(wctx, h);
+    if (h.flash > 0) h.flash--;
+    if (h.present && now - startTime < SKEL_MS) Renderer.drawSkeleton(wctx, h);
+  }
+
+  // 7. hud
+  if (hudVisible && now - hudLast > 200) {
+    hudLast = now;
+    hudEl.textContent =
+      'FPS ' + fps.toFixed(0) +
+      '  HANDS ' + handCount +
+      '  WEBS ' + WebPhysics.liveCount() +
+      '  DEPTH ' + DepthMode.status;
+  }
+}
+
+/* ---------------------------------- boot ---------------------------------- */
+(async function boot() {
+  resize();
+  try {
+    await Camera.start();
+  } catch (e) {
+    showMessage('camera access is the whole point 🕷️ — allow it and refresh.');
+    return;
+  }
+  try {
+    await Tracker.init();
+  } catch (e) {
+    showMessage('hand tracking failed to load — check your connection and refresh.');
+    return;
+  }
+  resize();
+  prevTime = performance.now();
+  startTime = performance.now();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
